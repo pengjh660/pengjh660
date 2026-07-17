@@ -28,6 +28,10 @@ import {
   OPENAI_OAUTH_DUMMY_KEY,
   shouldUseOpenAICodexAuth,
 } from '../openaiAuth/fetch.js'
+import {
+  buildOpenAIChatFetch,
+  isOpenAIChatProvider,
+} from './openaiRouter.js'
 import { isOpenAIResponsesModel } from '../openaiAuth/models.js'
 import { isDebugToStdErr, logForDebugging } from '../../utils/debug.js'
 import {
@@ -204,9 +208,11 @@ export async function getAnthropicClient({
     await configureApiKeyHeaders(defaultHeaders, getIsNonInteractiveSession())
   }
 
-  const resolvedFetch = usingOpenAICodex
-    ? buildOpenAICodexFetch(fetchOverride, source)
-    : buildFetch(fetchOverride, source)
+  const resolvedFetch = isOpenAIChatProvider()
+    ? buildOpenAIChatFetch(fetchOverride, source)
+    : usingOpenAICodex
+      ? buildOpenAICodexFetch(fetchOverride, source)
+      : buildFetch(fetchOverride, source)
 
   const ARGS = {
     defaultHeaders,
