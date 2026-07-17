@@ -55,7 +55,7 @@ export function buildOpenAIChatFetch(
     const openaiUrl = resolveChatCompletionsUrl()
     const openaiToken = resolveOpenAIToken()
 
-    const model = String(anthropicBody.model || 'gpt-4o')
+    const model = String(anthropicBody.model || 'gpt-4o').replace(/\[(1|2)m\]/gi, '')
 
     const openaiRequest = anthropicToOpenaiChat({
       model,
