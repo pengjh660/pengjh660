@@ -9,12 +9,15 @@ export function isOpenAIChatProvider(): boolean {
   return isEnvTruthy(process.env.CLAUDE_CODE_OPENAI_CHAT)
 }
 
-function resolveOpenAIBaseUrl(): string {
-  return process.env.ANTHROPIC_BASE_URL || 'https://api.openai.com/v1'
+function resolveChatCompletionsUrl(): string {
+  const base = process.env.ANTHROPIC_BASE_URL || 'https://api.openai.com/v1'
+  const normalized = base.replace(/\/+$/, '')
+  if (normalized.endsWith('/chat/completions')) return normalized
+  return `${normalized}/chat/completions`
 }
 
-function resolveOpenAIKey(): string {
-  return process.env.ANTHROPIC_API_KEY || process.env.OPENAI_API_KEY || ''
+function resolveOpenAIToken(): string {
+  return process.env.ANTHROPIC_API_KEY || process.env.ANTHROPIC_AUTH_TOKEN || process.env.OPENAI_API_KEY || ''
 }
 
 function isEnvTruthy(v: string | undefined): boolean {
@@ -49,8 +52,8 @@ export function buildOpenAIChatFetch(
       return inner(input, init)
     }
 
-    const openaiBaseUrl = resolveOpenAIBaseUrl().replace(/\/+$/, '')
-    const openaiKey = resolveOpenAIKey()
+    const openaiUrl = resolveChatCompletionsUrl()
+    const openaiToken = resolveOpenAIToken()
 
     const model = String(anthropicBody.model || 'gpt-4o')
 
@@ -68,15 +71,13 @@ export function buildOpenAIChatFetch(
       stream: true,
     })
 
-    const openaiUrl = `${openaiBaseUrl}/chat/completions`
-
     logForDebugging(`[OpenAI] POST ${openaiUrl} model=${model}`)
 
     const openaiResponse = await inner(openaiUrl, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        ...(openaiKey ? { Authorization: `Bearer ${openaiKey}` } : {}),
+        ...(openaiToken ? { Authorization: `Bearer ${openaiToken}` } : {}),
       },
       body: JSON.stringify(openaiRequest),
       signal: init.signal,
