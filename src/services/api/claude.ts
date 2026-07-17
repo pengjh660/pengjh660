@@ -1827,6 +1827,7 @@ async function* queryModel(
   let ttftMs = 0;
   let partialMessage: BetaMessage | undefined = undefined;
   const contentBlocks: (BetaContentBlock | ConnectorTextBlock)[] = [];
+  let pendingText = "";
   let usage: NonNullableUsage = EMPTY_USAGE;
   let costUSD = 0;
   let stopReason: BetaStopReason | null = null;
@@ -2254,6 +2255,10 @@ async function* queryModel(
               });
               throw new Error("Message not found");
             }
+            if (contentBlock.type === "text") {
+              pendingText += contentBlock.text;
+              break;
+            }
             const m: AssistantMessage = {
               message: {
                 ...partialMessage,
@@ -2358,6 +2363,29 @@ async function* queryModel(
             break;
           }
           case "message_stop":
+            if (pendingText) {
+              const textBlock: BetaContentBlock = { type: "text", text: pendingText, citations: null };
+              pendingText = "";
+              const textMsg: AssistantMessage = {
+                message: {
+                  ...partialMessage!,
+                  content: normalizeContentFromAPI(
+                    [textBlock],
+                    tools,
+                    options.agentId,
+                  ),
+                },
+                requestId: streamRequestId ?? undefined,
+                type: "assistant",
+                uuid: randomUUID(),
+                timestamp: new Date().toISOString(),
+                ...(process.env.USER_TYPE === "ant" &&
+                  research !== undefined && { research }),
+                ...(advisorModel && { advisorModel }),
+              };
+              newMessages.push(textMsg);
+              yield textMsg;
+            }
             break;
         }
 
@@ -2397,6 +2425,32 @@ async function* queryModel(
         // whose exit_path='error' probe guards on streamWatchdogFiredAt.
         streamWatchdogFiredAt = null;
         throw new Error("Stream idle timeout - no chunks received");
+      }
+
+      // Flush any remaining pending text that was not flushed by message_stop
+      // (safety net for streams that end without message_stop).
+      if (pendingText) {
+        const textBlock: BetaContentBlock = { type: "text", text: pendingText, citations: null };
+        pendingText = "";
+        const textMsg: AssistantMessage = {
+          message: {
+            ...partialMessage!,
+            content: normalizeContentFromAPI(
+              [textBlock],
+              tools,
+              options.agentId,
+            ),
+          },
+          requestId: streamRequestId ?? undefined,
+          type: "assistant",
+          uuid: randomUUID(),
+          timestamp: new Date().toISOString(),
+          ...(process.env.USER_TYPE === "ant" &&
+            research !== undefined && { research }),
+          ...(advisorModel && { advisorModel }),
+        };
+        newMessages.push(textMsg);
+        yield textMsg;
       }
 
       // Detect when the stream completed without producing any assistant messages.
