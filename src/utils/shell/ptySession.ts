@@ -125,20 +125,25 @@ export class PtySession {
     marker: string,
     timeout: number,
   ): Promise<string> {
-    const searchKey = `\r\n__CLAUDE__`
     const markerCheck = `|${marker}|__`
     const startTime = Date.now()
 
     while (Date.now() - startTime < timeout) {
       const raw = this.outputBuf.slice(beforeLen)
-      const idx = raw.indexOf(searchKey)
+
+      // Try both search patterns:
+      //   \r\n__CLAUDE__  — PowerShell (actual output after echoed command)
+      //   \r__CLAUDE__    — Linux/bash (bracketed paste inserts \r before output)
+      // Neither matches the echoed command (which has "__CLAUDE__")
+      let idx = raw.indexOf('\r\n__CLAUDE__')
+      if (idx === -1) {
+        idx = raw.indexOf('\r__CLAUDE__')
+      }
       if (idx !== -1) {
-        // Verify the correct marker (not a previous command's marker)
         const after = raw.slice(idx)
         if (after.includes(markerCheck)) {
-          // Find the end of the meta line (next \r\n after the marker)
-          const endOfLine = after.indexOf('\r\n', searchKey.length)
-          const metaEnd = endOfLine !== -1 ? idx + endOfLine + 2 : raw.length
+          const endOfLine = after.indexOf('\n')
+          const metaEnd = endOfLine !== -1 ? idx + endOfLine + 1 : raw.length
           return raw.slice(0, metaEnd)
         }
       }
@@ -146,6 +151,20 @@ export class PtySession {
     }
 
     throw new Error(`PTY command timed out after ${timeout}ms`)
+  }
+
+  // Find the __CLAUDE__ marker in the actual output (not the echoed command)
+  // Actual output has \r or \n before __CLAUDE__; echoed command has "
+  private findActualMarker(raw: string): number {
+    const markerEnd = '__CLAUDE__'
+    let pos = 0
+    while (true) {
+      const idx = raw.indexOf(markerEnd, pos)
+      if (idx === -1) return -1
+      const prev = idx > 0 ? raw[idx - 1] : ''
+      if (prev === '\r' || prev === '\n') return idx
+      pos = idx + 1
+    }
   }
 
   private parseOutput(
@@ -156,10 +175,11 @@ export class PtySession {
     const exitCode = metaMatch ? parseInt(metaMatch[1], 10) : 0
     const cwd = metaMatch?.[2] || ''
 
-    // Extract stdout: remove echoed command (first line) and echoed meta-command (last line)
-    const metaIdx = raw.indexOf('__CLAUDE__')
+    // Find the actual output's __CLAUDE__ (not the echoed command's)
+    const metaIdx = this.findActualMarker(raw)
     const cmdSection = metaIdx !== -1 ? raw.slice(0, metaIdx) : raw
     const lines = cmdSection.split(/\r?\n/)
+    // Remove echoed command (first line) and trailing empty (last line)
     const stdoutLines = lines.slice(1, -1)
     const stdout = stdoutLines.join('\r\n').trimEnd()
 
