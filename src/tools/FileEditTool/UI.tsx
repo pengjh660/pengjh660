@@ -133,22 +133,14 @@ export function renderToolUseErrorMessage(result: ToolResultBlockParam['content'
   const {
     verbose
   } = options;
-  if (!verbose && typeof result === 'string' && extractTag(result, 'tool_use_error')) {
+  if (!verbose && typeof result === 'string') {
     const errorMessage = extractTag(result, 'tool_use_error');
-    // Show a less scary message for intended behavior
-    if (errorMessage?.includes('File has not been read yet')) {
+    if (errorMessage) {
+      const firstLine = firstLineOf(errorMessage);
       return <MessageResponse>
-          <Text dimColor>File must be read first</Text>
+          <Text color="error">{firstLine}</Text>
         </MessageResponse>;
     }
-    if (errorMessage?.includes(FILE_NOT_FOUND_CWD_NOTE)) {
-      return <MessageResponse>
-          <Text color="error">File not found</Text>
-        </MessageResponse>;
-    }
-    return <MessageResponse>
-        <Text color="error">Error editing file</Text>
-      </MessageResponse>;
   }
   return <FallbackToolUseErrorMessage result={result} verbose={verbose} />;
 }
@@ -260,7 +252,7 @@ async function loadRejectionDiff(filePath: string, oldString: string, newString:
         fileContent: undefined
       };
     }
-    const actualOld = findActualString(ctx.content, oldString) || oldString;
+    const actualOld = findActualString(ctx.content, oldString).actualString || oldString;
     const actualNew = preserveQuoteStyle(oldString, actualOld, newString);
     const {
       patch

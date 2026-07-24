@@ -75,6 +75,10 @@ const outputSchema = lazySchema(() =>
       .boolean()
       .describe('Whether the user modified the proposed changes'),
     replaceAll: z.boolean().describe('Whether all occurrences were replaced'),
+    warnings: z
+      .array(z.string())
+      .optional()
+      .describe('Warnings about match-quality heuristics applied (e.g. indentation normalization)'),
     gitDiff: gitDiffSchema().optional(),
   }),
 )

@@ -12,8 +12,12 @@ import {
   addLineNumbers,
   convertLeadingTabsToSpaces,
   readFileSyncCached,
+  stripLineNumberPrefix,
 } from '../../utils/file.js'
 import type { EditInput, FileEdit } from './types.js'
+
+// Line-level char-overlap threshold for suggesting similar lines in error messages.
+const LINE_SIMILARITY_THRESHOLD = 0.5
 
 // Claude can't output curly quotes, so we define them as constants here for Claude to use
 // in the code. We do this because we normalize curly quotes to straight quotes
@@ -64,32 +68,555 @@ export function stripTrailingWhitespace(str: string): string {
 }
 
 /**
- * Finds the actual string in the file content that matches the search string,
- * accounting for quote normalization
- * @param fileContent The file content to search in
- * @param searchString The string to search for
- * @returns The actual string found in the file, or null if not found
+ * Finds the actual string in the file content that matches the search string.
+ *
+ * Applies escalating fallback heuristics when an exact match fails:
+ *   0. Exact substring match
+ *   1. Curly-quote → straight-quote normalization
+ *   2. Read-tool line-number prefix stripping (model accidentally included "123\t")
+ *   3. Whitespace tolerance — trailing spaces per line, surrounding blank lines
+ *   4. Indentation normalization — tabs ↔ spaces
+ *
+ * Returns { actualString, failReason? }. failReason carries diagnostics for
+ * friendly error messages when every level fails.
  */
 export function findActualString(
   fileContent: string,
   searchString: string,
-): string | null {
-  // First try exact match
+): { actualString: string | null; failReason?: string; warnings?: string[] } {
+  // Level 0: Exact match.
+  // When old_string has surplus surrounding blank lines (copy-paste artifact
+  // from Read output), includes() matches but over-consumes real blank lines
+  // in the file (e.g. "foo\n\n" eats the separator between functions). Prefer
+  // the tightest version that still matches as a unique instance.
   if (fileContent.includes(searchString)) {
-    return searchString
+    const refined = trimSurplusSurroundingBlankLines(searchString, fileContent)
+    if (refined) {
+      return {
+        actualString: refined,
+        warnings: [
+          'Surrounding blank lines were trimmed from old_string to avoid consuming real file content.',
+        ],
+      }
+    }
+    return { actualString: searchString }
   }
 
-  // Try with normalized quotes
+  // Level 1: Quote normalization
   const normalizedSearch = normalizeQuotes(searchString)
   const normalizedFile = normalizeQuotes(fileContent)
+  const quoteIdx = normalizedFile.indexOf(normalizedSearch)
+  if (quoteIdx !== -1) {
+    return {
+      actualString: fileContent.substring(
+        quoteIdx,
+        quoteIdx + searchString.length,
+      ),
+    }
+  }
 
-  const searchIndex = normalizedFile.indexOf(normalizedSearch)
-  if (searchIndex !== -1) {
-    // Find the actual string in the file that matches
-    return fileContent.substring(searchIndex, searchIndex + searchString.length)
+  // Level 2: Line-number prefix stripping.
+  // Models sometimes copy "123\tcontent" from Read output into old_string.
+  const strippedSearch = stripLineNumberPrefixes(searchString)
+  if (strippedSearch !== searchString && fileContent.includes(strippedSearch)) {
+    return {
+      actualString: strippedSearch,
+      warnings: [
+        'Line-number prefixes from Read tool output were stripped from old_string before matching.',
+      ],
+    }
+  }
+
+  // Level 3a: Trailing-whitespace tolerance on individual lines.
+  const trimmedLineSearch = stripTrailingWhitespace(searchString)
+  if (
+    trimmedLineSearch !== searchString &&
+    fileContent.includes(trimmedLineSearch)
+  ) {
+    return {
+      actualString: trimmedLineSearch,
+      warnings: [
+        'Trailing whitespace was removed from old_string lines to match the file.',
+      ],
+    }
+  }
+
+  // Level 3b: Surrounding-blank-line tolerance.
+  // Model may have included extra leading/trailing newlines from Read output
+  // that aren't part of the actual file content. Strip and retry.
+  const unblankedSearch = searchString.replace(/^\n+/, '').replace(/\n+$/, '')
+  if (
+    unblankedSearch !== searchString &&
+    unblankedSearch.length > 0 &&
+    fileContent.includes(unblankedSearch)
+  ) {
+    return {
+      actualString: unblankedSearch,
+      warnings: [
+        'Leading or trailing blank lines were removed from old_string before matching.',
+      ],
+    }
+  }
+
+  // Level 3c: Combined — trim lines AND strip surrounding blanks.
+  if (trimmedLineSearch !== searchString && unblankedSearch !== searchString) {
+    const combined = stripTrailingWhitespace(unblankedSearch)
+    if (combined !== searchString && fileContent.includes(combined)) {
+      return {
+        actualString: combined,
+        warnings: [
+          'Trailing whitespace and surrounding blank lines were normalized in old_string to match the file.',
+        ],
+      }
+    }
+    const ubTrimmed = trimmedLineSearch
+      .replace(/^\n+/, '')
+      .replace(/\n+$/, '')
+    if (ubTrimmed !== searchString && fileContent.includes(ubTrimmed)) {
+      return {
+        actualString: ubTrimmed,
+        warnings: [
+          'Trailing whitespace and surrounding blank lines were normalized in old_string to match the file.',
+        ],
+      }
+    }
+  }
+
+  // Level 4: Indentation normalization (tabs ↔ spaces)
+  const indentResult = tryIndentationNormalizedMatch(fileContent, searchString)
+  if (indentResult !== null) {
+    const warning =
+      'The indentation in old_string was normalized before matching — the file uses a different indentation style. The file\'s existing indentation was preserved in the edit. Verify that the resulting code has correct indentation.'
+    return {
+      actualString: indentResult,
+      warnings: [warning],
+    }
+  }
+
+  // All levels exhausted — build diagnostics for the error message
+  return {
+    actualString: null,
+    failReason: buildMatchFailReason(searchString, fileContent),
+  }
+}
+
+// -- Level 0 refinement -------------------------------------------------------
+
+/**
+ * When old_string starts or ends with newlines, the raw includes() match may
+ * consume real blank lines that belong to the file rather than to the edit.
+ * Walk inward one character at a time; return the tightest variant that still
+ * matches as a unique instance.
+ */
+function trimSurplusSurroundingBlankLines(
+  searchString: string,
+  fileContent: string,
+): string | null {
+  // Only bother when there are actually surrounding newlines.
+  if (!searchString.startsWith('\n') && !searchString.endsWith('\n')) {
+    return null
+  }
+
+  let best: string | null = null
+  let current = searchString
+
+  // Strip one leading newline at a time.
+  let leading = 0
+  while (current.startsWith('\n')) {
+    const candidate = current.slice(1)
+    if (candidate.length === 0) break
+    // Count occurrences before and after — want the same unique match.
+    const before = fileContent.split(current).length - 1
+    const after = fileContent.split(candidate).length - 1
+    // Accept only if the tighter match is still present and doesn't explode
+    // into more matches (which would happen if candidate is too short/generic).
+    if (after > 0 && after <= before) {
+      current = candidate
+      best = current
+    } else {
+      break
+    }
+    leading++
+  }
+
+  // Strip one trailing newline at a time.
+  let trailing = 0
+  while (current.endsWith('\n')) {
+    const candidate = current.slice(0, -1)
+    if (candidate.length === 0) break
+    const before = fileContent.split(current).length - 1
+    const after = fileContent.split(candidate).length - 1
+    if (after > 0 && after <= before) {
+      current = candidate
+      best = current
+    } else {
+      break
+    }
+    trailing++
+  }
+
+  return leading > 0 || trailing > 0 ? best : null
+}
+
+// -- Level 2 helpers ----------------------------------------------------------
+
+function stripLineNumberPrefixes(str: string): string {
+  return str
+    .split('\n')
+    .map(line => stripLineNumberPrefix(line))
+    .join('\n')
+}
+
+// -- Level 3 helpers ----------------------------------------------------------
+
+function tryWhitespaceTolerantMatch(
+  fileContent: string,
+  searchString: string,
+): string | null {
+  // 3a: Strip trailing whitespace from each line (model may have kept trailing
+  //     spaces the editor stripped or vice versa).
+  const trimmedSearch = stripTrailingWhitespace(searchString)
+  if (trimmedSearch !== searchString && fileContent.includes(trimmedSearch)) {
+    return trimmedSearch
+  }
+
+  // 3b: Strip surrounding blank lines (model may have included an extra leading
+  //     or trailing newline that isn't part of the file content).
+  const unblankedSearch = searchString.replace(/^\n+/, '').replace(/\n+$/, '')
+  if (
+    unblankedSearch !== searchString &&
+    unblankedSearch.length > 0 &&
+    fileContent.includes(unblankedSearch)
+  ) {
+    return unblankedSearch
+  }
+
+  // 3c: Combined — trim lines then strip surrounding blanks.
+  if (trimmedSearch !== searchString && unblankedSearch !== searchString) {
+    const combined = stripTrailingWhitespace(unblankedSearch)
+    if (combined !== searchString && fileContent.includes(combined)) {
+      return combined
+    }
+    // Also try unblanked version of trimmed
+    const ubTrimmed = trimmedSearch.replace(/^\n+/, '').replace(/\n+$/, '')
+    if (ubTrimmed !== searchString && fileContent.includes(ubTrimmed)) {
+      return ubTrimmed
+    }
   }
 
   return null
+}
+
+// -- Level 4 helpers ----------------------------------------------------------
+
+function tryIndentationNormalizedMatch(
+  fileContent: string,
+  searchString: string,
+): string | null {
+  // 4a: Search has tabs but file might have spaces.
+  const tabNormalizedSearch = searchString.replace(/\t/g, '  ')
+  if (tabNormalizedSearch !== searchString) {
+    const tabNormalizedFile = fileContent.replace(/\t/g, '  ')
+    const idx = tabNormalizedFile.indexOf(tabNormalizedSearch)
+    if (idx !== -1) {
+      return mapNormalizedPositionBack(
+        fileContent,
+        tabNormalizedFile,
+        idx,
+        tabNormalizedSearch.length,
+      )
+    }
+  }
+
+  // 4b: Search has spaces but file has tabs (reverse of 4a).
+  const tabNormalizedFile = fileContent.replace(/\t/g, '  ')
+  const idx = tabNormalizedFile.indexOf(searchString)
+  if (idx !== -1) {
+    return mapNormalizedPositionBack(
+      fileContent,
+      tabNormalizedFile,
+      idx,
+      searchString.length,
+    )
+  }
+
+  // 4c: Leading-whitespace-agnostic match.
+  // When the model copied a line from Read output with different indentation
+  // (e.g. spaces in old_string vs tabs in the file, or mismatched indent width),
+  // strip all leading whitespace and compare only the content part.
+  const wsAgnosticResult = tryWsAgnosticMatch(fileContent, searchString)
+  if (wsAgnosticResult !== null) {
+    return wsAgnosticResult
+  }
+
+  return null
+}
+
+// -- Level 4c helper ---------------------------------------------------------
+
+/**
+ * Try to match searchString against fileContent by stripping all leading
+ * whitespace from every line and comparing only the content.
+ *
+ * This handles cases where:
+ * - The model used spaces but the file uses tabs (with different widths)
+ * - The model guessed the wrong indentation level entirely
+ * - The file was reformatted (e.g. 2-space → 4-space indent)
+ *
+ * Returns the matched substring from the actual file content, or null.
+ */
+function tryWsAgnosticMatch(
+  fileContent: string,
+  searchString: string,
+): string | null {
+  const searchLines = searchString.split('\n')
+  const fileLines = fileContent.split('\n')
+
+  if (searchLines.length > fileLines.length) return null
+
+  // Strip leading whitespace from each line
+  const strippedSearch = searchLines.map(l => l.replace(/^\s+/, ''))
+  const strippedFile = fileLines.map(l => l.replace(/^\s+/, ''))
+
+  // Join with newline and search for consecutive line matches
+  const strippedSearchStr = strippedSearch.join('\n')
+  const strippedFileStr = strippedFile.join('\n')
+
+  const pos = strippedFileStr.indexOf(strippedSearchStr)
+  if (pos === -1) return null
+
+  // Count how many lines precede the match position
+  const prefix = strippedFileStr.slice(0, pos)
+  const startLineNum = prefix.length === 0 ? 0 : prefix.split('\n').length - 1
+
+  // Extract the actual (un-stripped) file lines
+  const actualLines = fileLines.slice(
+    startLineNum,
+    startLineNum + searchLines.length,
+  )
+  if (actualLines.length !== searchLines.length) return null
+
+  // Safety check: verify the stripped content of our match matches
+  const actualStripped = actualLines.map(l => l.replace(/^\s+/, ''))
+  if (actualStripped.join('\n') !== strippedSearchStr) return null
+
+  return actualLines.join('\n')
+}
+
+/**
+ * Given a position in a tab→"  "-normalized version of `original`, return the
+ * corresponding substring of `original` that covers `searchLength` characters
+ * in the normalized space.
+ */
+function mapNormalizedPositionBack(
+  original: string,
+  normalized: string,
+  normalizedPos: number,
+  searchLength: number,
+): string | null {
+  // Walk to the start position.
+  let origIdx = 0
+  let normIdx = 0
+  while (normIdx < normalizedPos && origIdx < original.length) {
+    normIdx += original[origIdx] === '\t' ? 2 : 1
+    origIdx++
+  }
+  if (normIdx !== normalizedPos) return null
+
+  const startIdx = origIdx
+
+  // Walk the search length in normalized space.
+  let remaining = searchLength
+  while (remaining > 0 && origIdx < original.length) {
+    remaining -= original[origIdx] === '\t' ? 2 : 1
+    origIdx++
+  }
+  // Allow a 1-char slop from the final newline — models sometimes omit it.
+  if (remaining > 1) return null
+
+  return original.substring(startIdx, origIdx)
+}
+
+// -- Diagnostic helpers for friendly error messages ---------------------------
+
+/**
+ * Build a human-readable explanation of _why_ findActualString failed, used in
+ * the errorCode 8 (string not found) message.
+ */
+function buildMatchFailReason(
+  searchString: string,
+  fileContent: string,
+): string {
+  const reasons: string[] = []
+
+  // Line-number prefix pattern: "   123→" or "123\t" at the start of a line.
+  if (/^\s*\d+[\t→]/.test(searchString.split('\n')[0] ?? '')) {
+    reasons.push(
+      `- The old_string appears to contain **line number prefixes** from Read tool output (e.g. "123→" or "123\\t"). Remove these prefixes — only the actual file content (after the prefix) belongs in old_string.`,
+    )
+  }
+
+  // Leading / trailing whitespace on the whole string.
+  if (searchString !== searchString.trim()) {
+    reasons.push(
+      `- old_string has **leading or trailing whitespace** that may not match the file. Try trimming it.`,
+    )
+    if (searchString.length !== searchString.trimStart().length) {
+      const extra = searchString.length - searchString.trimStart().length
+      reasons.push(`  (${extra} leading whitespace character(s) detected)`)
+    }
+    if (searchString.length !== searchString.trimEnd().length) {
+      const extra = searchString.length - searchString.trimEnd().length
+      reasons.push(`  (${extra} trailing whitespace character(s) detected)`)
+    }
+  }
+
+  // Trailing whitespace on individual lines.
+  const searchLines = searchString.split('\n')
+  const trailingLines = searchLines.filter(
+    (l, i) =>
+      l.length > 0 && l !== l.trimEnd() && !(i === searchLines.length - 1 && l === ''),
+  )
+  if (trailingLines.length > 0) {
+    reasons.push(
+      `- **Trailing spaces** detected on ${trailingLines.length} line(s) in old_string. The file may not have these.`,
+    )
+  }
+
+  // Find similar lines in the file for debugging.
+  const similar = findSimilarLinesInFile(searchString, fileContent)
+  if (similar) {
+    reasons.push(similar)
+  }
+
+  return reasons.length > 0
+    ? `Possible causes:\n${reasons.join('\n')}`
+    : ''
+}
+
+/**
+ * For each non-empty line in searchString (up to 3), find the most
+ * character-overlap-similar line in the file and report it as a suggestion.
+ */
+function findSimilarLinesInFile(
+  searchString: string,
+  fileContent: string,
+): string | null {
+  const searchLines = searchString
+    .split('\n')
+    .map(l => l.trim())
+    .filter(l => l.length > 0)
+  if (searchLines.length === 0) return null
+
+  const fileLines = fileContent.split('\n')
+  const matches: string[] = []
+
+  for (const searchLine of searchLines.slice(0, 3)) {
+    let bestScore = 0
+    let bestLine = ''
+    for (const fileLine of fileLines) {
+      if (fileLine.trim().length === 0) continue
+      const score = lineOverlapSimilarity(searchLine, fileLine)
+      if (score > bestScore && score >= LINE_SIMILARITY_THRESHOLD) {
+        bestScore = score
+        bestLine = fileLine
+      }
+    }
+    if (bestLine) {
+      const pct = Math.round(bestScore * 100)
+      const searchPreview =
+        searchLine.length > 40
+          ? searchLine.slice(0, 37) + '...'
+          : searchLine
+      matches.push(
+        `  \`${bestLine.trim()}\` (${pct}% match for \`${searchPreview}\`)`,
+      )
+    }
+  }
+
+  if (matches.length > 0) {
+    return (
+      `- **Similar lines** found in the file:\n${matches.slice(0, 3).join('\n')}\n` +
+      `  If one of these matches your intent, use it as old_string.`
+    )
+  }
+
+  return null
+}
+
+/** Jaccard-style character-set overlap between two strings. */
+function lineOverlapSimilarity(a: string, b: string): number {
+  const aNorm = a.trim()
+  const bNorm = b.trim()
+  if (aNorm === bNorm) return 1.0
+  if (aNorm.includes(bNorm) || bNorm.includes(aNorm)) return 0.85
+
+  const aSet = new Set(aNorm)
+  const bSet = new Set(bNorm)
+  let overlap = 0
+  for (const ch of aSet) {
+    if (bSet.has(ch)) overlap++
+  }
+  const union = new Set([...aSet, ...bSet]).size
+  return union > 0 ? overlap / union : 0
+}
+
+// -- Staleness diff helper (used by FileEditTool errorCode 7) ----------------
+
+/**
+ * Compute a short, human-readable summary of changes between the cached
+ * (pre-read) content and the current on-disk content. Capped at 5 hunks /
+ * 20 lines so the error message stays digestible.
+ *
+ * Must be try-catch safe; an exception here would replace the friendly
+ * errorCode 7 with a crash, defeating the whole purpose.
+ */
+export function getStalenessDiffSummary(
+  originalContent: string,
+  currentContent: string,
+): string {
+  try {
+    // Route through getPatchFromContents (from diff.ts) to ensure & and $
+    // are escaped before calling the diff library — raw structuredPatch
+    // chokes on unescaped ampersands (diff.ts:29-31).
+    const hunks = getPatchFromContents({
+      filePath: '',
+      oldContent: originalContent,
+      newContent: currentContent,
+    })
+
+    if (hunks.length === 0) {
+      return '(no hunks — file may only differ in whitespace)'
+    }
+
+    const MAX_HUNKS = 5
+    const MAX_LINES = 20
+
+    const allLines: string[] = []
+    for (const hunk of hunks.slice(0, MAX_HUNKS)) {
+      allLines.push(
+        `@@ ${hunk.oldStart},${hunk.oldLines} → ${hunk.newStart},${hunk.newLines} @@`,
+      )
+      for (const line of hunk.lines) {
+        allLines.push(line)
+      }
+    }
+
+    if (hunks.length > MAX_HUNKS || allLines.length > MAX_LINES) {
+      const truncated = allLines.slice(0, MAX_LINES)
+      const extraHunks = hunks.length - MAX_HUNKS
+      const omitted =
+        allLines.length - MAX_LINES + extraHunks * 4
+      return (
+        truncated.join('\n') +
+        `\n... (${omitted} more diff lines omitted)`
+      )
+    }
+
+    return allLines.join('\n')
+  } catch {
+    return '(unable to compute diff — re-read the file and retry)'
+  }
 }
 
 /**

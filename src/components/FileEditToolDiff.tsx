@@ -170,7 +170,7 @@ function diffToolInputsOnly(filePath: string, edits: FileEdit[]): DiffData {
   };
 }
 function normalizeEdit(fileContent: string, edit: FileEdit): FileEdit {
-  const actualOld = findActualString(fileContent, edit.old_string) || edit.old_string;
+  const actualOld = findActualString(fileContent, edit.old_string).actualString || edit.old_string;
   const actualNew = preserveQuoteStyle(edit.old_string, actualOld, edit.new_string);
   return {
     ...edit,

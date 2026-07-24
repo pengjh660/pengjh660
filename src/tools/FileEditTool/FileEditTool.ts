@@ -73,6 +73,7 @@ import {
   areFileEditsInputsEquivalent,
   findActualString,
   getPatchForEdit,
+  getStalenessDiffSummary,
   preserveQuoteStyle,
 } from './utils.js'
 
@@ -286,79 +287,106 @@ export const FileEditTool = buildTool({
       }
     }
 
-    // Check if file exists and get its last modified time
-    if (readTimestamp) {
-      const lastWriteTime = getFileModificationTime(fullFilePath)
-      if (lastWriteTime > readTimestamp.timestamp) {
-        // Timestamp indicates modification, but on Windows timestamps can change
-        // without content changes (cloud sync, antivirus, etc.). For full reads,
-        // compare content as a fallback to avoid false positives.
-        const isFullRead =
-          readTimestamp.offset === undefined &&
-          readTimestamp.limit === undefined
-        if (isFullRead && fileContent === readTimestamp.content) {
-          // Content unchanged, safe to proceed
-        } else {
-          return {
-            result: false,
-            behavior: 'ask',
-            message:
-              'File has been modified since read, either by the user or by a linter. Read it again before attempting to write it.',
-            errorCode: 7,
-          }
+    // Try matching old_string against the **current** file content first.
+    // This avoids the false-positive staleness case where the user modified an
+    // unrelated part of the file — the edit target is still present verbatim.
+    const file = fileContent
+    const matchResult = findActualString(file, old_string)
+
+    if (matchResult.actualString) {
+      // old_string exists in the current file — proceed regardless of mtime.
+      const actualOldString = matchResult.actualString
+      const matches = file.split(actualOldString).length - 1
+
+      if (matches > 1 && !replace_all) {
+        return {
+          result: false,
+          behavior: 'ask',
+          message: `Found ${matches} matches of the string to replace, but replace_all is false. To replace all occurrences, set replace_all to true. To replace only one occurrence, please provide more context to uniquely identify the instance.\nString: ${old_string}`,
+          meta: {
+            isFilePathAbsolute: String(isAbsolute(file_path)),
+            actualOldString,
+          },
+          errorCode: 9,
         }
       }
-    }
 
-    const file = fileContent
-
-    // Use findActualString to handle quote normalization
-    const actualOldString = findActualString(file, old_string)
-    if (!actualOldString) {
-      return {
-        result: false,
-        behavior: 'ask',
-        message: `String to replace not found in file.\nString: ${old_string}`,
-        meta: {
-          isFilePathAbsolute: String(isAbsolute(file_path)),
+      // Additional validation for Claude settings files
+      const settingsValidationResult = validateInputForSettingsFileEdit(
+        fullFilePath,
+        file,
+        () => {
+          return replace_all
+            ? file.replaceAll(actualOldString, new_string)
+            : file.replace(actualOldString, new_string)
         },
-        errorCode: 8,
+      )
+
+      if (settingsValidationResult !== null) {
+        return settingsValidationResult
       }
+
+      return { result: true, meta: { actualOldString } }
     }
 
-    const matches = file.split(actualOldString).length - 1
+    // old_string NOT found in the current file.
+    // Determine whether staleness (user/linter modification) is the cause.
 
-    // Check if we have multiple matches but replace_all is false
-    if (matches > 1 && !replace_all) {
-      return {
-        result: false,
-        behavior: 'ask',
-        message: `Found ${matches} matches of the string to replace, but replace_all is false. To replace all occurrences, set replace_all to true. To replace only one occurrence, please provide more context to uniquely identify the instance.\nString: ${old_string}`,
-        meta: {
-          isFilePathAbsolute: String(isAbsolute(file_path)),
-          actualOldString,
-        },
-        errorCode: 9,
+    const lastWriteTime = getFileModificationTime(fullFilePath)
+    const isFullRead =
+      (readTimestamp.offset === undefined ||
+        readTimestamp.offset === 1) &&
+      (readTimestamp.limit === undefined ||
+        readTimestamp.limit >= Number.MAX_SAFE_INTEGER)
+    const fileContentChanged =
+      isFullRead &&
+      readTimestamp.content !== undefined &&
+      fileContent !== readTimestamp.content
+
+    if (lastWriteTime > readTimestamp.timestamp && fileContentChanged) {
+      // File was modified since read. Check whether old_string existed in the
+      // cached original — if so, the user's changes overlapped with the edit
+      // target and the model must re-read.
+      const origMatch = findActualString(
+        readTimestamp.content!,
+        old_string,
+      )
+      if (origMatch.actualString) {
+        const diffSummary = getStalenessDiffSummary(
+          readTimestamp.content!,
+          fileContent,
+        )
+        return {
+          result: false,
+          behavior: 'ask',
+          message:
+            'File has been modified since the last read, and the section ' +
+            'you tried to edit overlaps with one of the changed regions.\n\n' +
+            `Recent changes:\n${diffSummary}\n\n` +
+            'Please re-read the file with the Read tool, then retry the edit ' +
+            'with the current content.',
+          errorCode: 7,
+        }
       }
+      // File changed, but old_string wasn't in the original either —
+      // the edit never would have worked. Fall through to errorCode 8.
     }
 
-    // Additional validation for Claude settings files
-    const settingsValidationResult = validateInputForSettingsFileEdit(
-      fullFilePath,
-      file,
-      () => {
-        // Simulate the edit to get the final content using the exact same logic as the tool
-        return replace_all
-          ? file.replaceAll(actualOldString, new_string)
-          : file.replace(actualOldString, new_string)
+    // Genuine match failure (file unchanged or the string never existed).
+    const failDetail = matchResult.failReason
+      ? `\n${matchResult.failReason}\n`
+      : ''
+    return {
+      result: false,
+      behavior: 'ask',
+      message:
+        `String to replace not found in file.${failDetail}\n` +
+        `String: ${old_string}`,
+      meta: {
+        isFilePathAbsolute: String(isAbsolute(file_path)),
       },
-    )
-
-    if (settingsValidationResult !== null) {
-      return settingsValidationResult
+      errorCode: 8,
     }
-
-    return { result: true, meta: { actualOldString } }
   },
   inputsEquivalent(input1, input2) {
     return areFileEditsInputsEquivalent(
@@ -448,28 +476,62 @@ export const FileEditTool = buildTool({
       lineEndings: endings,
     } = readFileForEdit(absoluteFilePath)
 
+    let actualOldString: string
+    let matchWarnings: string[] | undefined
+
     if (fileExists) {
-      const lastWriteTime = getFileModificationTime(absoluteFilePath)
-      const lastRead = readFileState.get(absoluteFilePath)
-      if (!lastRead || lastWriteTime > lastRead.timestamp) {
-        // Timestamp indicates modification, but on Windows timestamps can change
-        // without content changes (cloud sync, antivirus, etc.). For full reads,
-        // compare content as a fallback to avoid false positives.
+      // Try matching old_string on the current file content first.
+      // If the target region is unchanged, the edit is safe even if other
+      // parts of the file were modified.
+      const currentMatch = findActualString(originalFileContents, old_string)
+
+      if (currentMatch.actualString) {
+        actualOldString = currentMatch.actualString
+        matchWarnings = currentMatch.warnings
+      } else {
+        // String not found. Check if the file was modified since the read.
+        const lastWriteTime = getFileModificationTime(absoluteFilePath)
+        const lastRead = readFileState.get(absoluteFilePath)
         const isFullRead =
           lastRead &&
-          lastRead.offset === undefined &&
-          lastRead.limit === undefined
-        const contentUnchanged =
-          isFullRead && originalFileContents === lastRead.content
-        if (!contentUnchanged) {
-          throw new Error(FILE_UNEXPECTEDLY_MODIFIED_ERROR)
+          (lastRead.offset === undefined ||
+            lastRead.offset === 1) &&
+          (lastRead.limit === undefined ||
+            lastRead.limit >= Number.MAX_SAFE_INTEGER)
+        const fileModifiedSinceRead =
+          lastRead &&
+          lastWriteTime > lastRead.timestamp &&
+          isFullRead &&
+          originalFileContents !== lastRead.content
+
+        if (fileModifiedSinceRead) {
+          // Check if old_string existed in the cached original — if so the
+          // user's modifications overlapped with the edit target.
+          const origMatch = findActualString(
+            lastRead!.content!,
+            old_string,
+          )
+          if (origMatch.actualString) {
+            const diffSummary = getStalenessDiffSummary(
+              lastRead!.content!,
+              originalFileContents,
+            )
+            throw new Error(
+              `${FILE_UNEXPECTEDLY_MODIFIED_ERROR}\n\nRecent changes:\n${diffSummary}`,
+            )
+          }
         }
+
+        // String not found, and it's not a staleness issue — the match itself
+        // is invalid for the current file content.
+        throw new Error(
+          `String not found in file. ${currentMatch.failReason ?? ''}`.trim(),
+        )
       }
     }
 
-    // 3. Use findActualString to handle quote normalization
-    const actualOldString =
-      findActualString(originalFileContents, old_string) || old_string
+    // File doesn't exist yet — fall back to old_string as-is (new file path).
+    actualOldString ??= old_string
 
     // Preserve curly quotes in new_string when the file uses them
     const actualNewString = preserveQuoteStyle(
@@ -566,6 +628,7 @@ export const FileEditTool = buildTool({
       structuredPatch: patch,
       userModified: userModified ?? false,
       replaceAll: replace_all,
+      ...(matchWarnings && { warnings: matchWarnings }),
       ...(gitDiff && { gitDiff }),
     }
     return {
@@ -573,23 +636,27 @@ export const FileEditTool = buildTool({
     }
   },
   mapToolResultToToolResultBlockParam(data: FileEditOutput, toolUseID) {
-    const { filePath, userModified, replaceAll } = data
+    const { filePath, userModified, replaceAll, warnings } = data
     const modifiedNote = userModified
       ? '.  The user modified your proposed changes before accepting them. '
       : ''
+    const warningsNote =
+      warnings && warnings.length > 0
+        ? ` Note: ${warnings.join(' ')}`
+        : ''
 
     if (replaceAll) {
       return {
         tool_use_id: toolUseID,
         type: 'tool_result',
-        content: `The file ${filePath} has been updated${modifiedNote}. All occurrences were successfully replaced.`,
+        content: `The file ${filePath} has been updated${modifiedNote}. All occurrences were successfully replaced.${warningsNote}`,
       }
     }
 
     return {
       tool_use_id: toolUseID,
       type: 'tool_result',
-      content: `The file ${filePath} has been updated successfully${modifiedNote}.`,
+      content: `The file ${filePath} has been updated successfully${modifiedNote}.${warningsNote}`,
     }
   },
 } satisfies ToolDef<ReturnType<typeof inputSchema>, FileEditOutput>)
